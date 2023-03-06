@@ -7,7 +7,7 @@ from Functions import generate_grid,save_img,save_flow, load_4D_with_header, img
 import glob
 import torch.utils.data as Data
 import random
-from oasis_data import get_data_list
+from oasis_data import get_data_list, extract_id
 import torch.nn.functional as F
 
 
@@ -122,10 +122,10 @@ def test(device):
                     dice_total.append(dice_score)
 
                     inverse_compose = com_transform(F_X_Y, F_Y_X, grid, range_flow)
-                    violation = torch.mean(torch.sum((inverse_compose*range_flow)**2, dim=1)).item()
+                    violation = torch.mean(torch.sqrt(torch.sum((inverse_compose*range_flow)**2, dim=1))).item()
                     violation_total.append(violation)
 
-                    flips_total.append((JacboianDet(F_X_Y.permute(0,2,3,4,1), grid)<0).float().mean().item()*100.)
+                    flips_total.append((JacboianDet(F_X_Y.permute(0,2,3,4,1)*range_flow, grid)<0).float().mean().item()*100.)
                     
                     # warped_B = transform(moved_img, F_Y_X.permute(0, 2, 3, 4, 1) * range_flow, grid).data.cpu().numpy()[0, 0, :, :, :]
                     # warped_A = transform(fixed_img, F_X_Y.permute(0, 2, 3, 4, 1) * range_flow, grid).data.cpu().numpy()[0, 0, :, :, :]
