@@ -2,11 +2,13 @@ import os
 from argparse import ArgumentParser
 import numpy as np
 import torch
-from Models import SYMNet,SpatialTransform, DiffeomorphicTransform, CompositionTransform, SpatialTransformNearest
-from Functions import generate_grid,save_img,save_flow, load_4D_with_header, imgnorm, Predict_dataset_crop
+from Models import SYMNet,SpatialTransform, DiffeomorphicTransform, CompositionTransform, SpatialTransformNearest, JacboianDet
+from Functions import generate_grid,save_img,save_flow, load_4D_with_header, imgnorm, Predict_dataset_crop, Predict_dataset
 import glob
 import torch.utils.data as Data
 import random
+from oasis_data import get_data_list
+import torch.nn.functional as F
 
 
 parser = ArgumentParser()
@@ -33,6 +35,13 @@ parser.add_argument("-g", type=str,
                     dest="g",
                     default=0)
 
+
+def crop_center(img, cropx, cropy, cropz):
+    _,_, x, y, z = img.shape
+    startx = x//2 - cropx//2
+    starty = y//2 - cropy//2
+    startz = z//2 - cropz//2
+    return img[:,:,startx:startx+cropx, starty:starty+cropy, startz:startz+cropz]
 
 def dice(im1, atlas):
     unique_class = np.unique(atlas)
@@ -68,77 +77,78 @@ def test(device):
     use_cuda = True
     device = torch.device("cuda" if use_cuda else "cpu")
 
-    datapath = opt.datapath
-    test_id_list = list(range(260, 410))
-    random.shuffle(test_id_list)
-    fixed_list = test_id_list[:5]
-    moving_list = test_id_list[5:]
-
-    total_img_list = sorted(glob.glob(datapath + '/OASIS_OAS1_*_MR1/aligned_norm.nii.gz'))
-    total_segs_list = sorted(glob.glob(datapath + '/OASIS_OAS1_*_MR1/aligned_seg35.nii.gz'))
+    fixed_imgs, fixed_segs, moving_imgs, moving_segs = get_data_list()
 
     dice_total = []
     violation_total = []
-    for f in fixed_list:
-        fixed_img = total_img_list[f]
-        fixed_label = total_segs_list[f]
-        imgs = [total_img_list[i] for i in moving_list]
-        labels = [total_segs_list[i] for i in moving_list]
+    flips_total = []
+    with torch.no_grad():
+        for f, f_seg in zip(fixed_imgs, fixed_segs):
 
-        valid_generator = Data.DataLoader(Predict_dataset_crop(fixed_img, imgs, fixed_label, labels, norm=True),
-                                            batch_size=1,
-                                            shuffle=False, num_workers=2)
-        with torch.no_grad():
-            for batch_idx, data in enumerate(valid_generator):
-                X, Y, X_label, Y_label = data['move'].to(device), data['fixed'].to(device), data['move_label'].to(
-                    device), data['fixed_label'].to(device)
-                
-                F_xy, F_yx = model(X, Y)
+            valid_generator = Data.DataLoader(Predict_dataset(f, moving_imgs, f_seg, moving_segs, norm=True),
+                                                batch_size=1,
+                                                shuffle=False, num_workers=2)
+            with torch.no_grad():
+                for batch_idx, data in enumerate(valid_generator):
+                    X, Y, X_label, Y_label = (
+                        crop_center(data['move'], *imgshape).to(device), 
+                        crop_center(data['fixed'], *imgshape).to(device), 
+                        crop_center(data['move_label'], *imgshape).to(device), 
+                        crop_center(data['fixed_label'], *imgshape).to(device))
+                    
+                    F_xy, F_yx = model(X, Y)
 
-                F_X_Y_half = diff_transform(F_xy, grid, range_flow)
-                F_Y_X_half = diff_transform(F_yx, grid, range_flow)
+                    F_X_Y_half = diff_transform(F_xy, grid, range_flow)
+                    F_Y_X_half = diff_transform(F_yx, grid, range_flow)
 
-                F_X_Y_half_inv = diff_transform(-F_xy, grid, range_flow)
-                F_Y_X_half_inv = diff_transform(-F_yx, grid, range_flow)
+                    F_X_Y_half_inv = diff_transform(-F_xy, grid, range_flow)
+                    F_Y_X_half_inv = diff_transform(-F_yx, grid, range_flow)
 
-                F_X_Y = com_transform(F_X_Y_half, F_Y_X_half_inv, grid, range_flow)
-                F_Y_X = com_transform(F_Y_X_half, F_X_Y_half_inv, grid, range_flow)
+                    F_X_Y = com_transform(F_X_Y_half, F_Y_X_half_inv, grid, range_flow)
+                    F_Y_X = com_transform(F_Y_X_half, F_X_Y_half_inv, grid, range_flow)
 
-                # F_BA = F_Y_X.permute(0, 2, 3, 4, 1).data.cpu().numpy()[0, :, :, :, :]
-                # F_BA = F_BA.astype(np.float32) * range_flow
-                
-                # F_AB = F_X_Y.permute(0, 2, 3, 4, 1).data.cpu().numpy()[0, :, :, :, :]
-                # F_AB = F_AB.astype(np.float32) * range_flow
+                    # F_BA = F_Y_X.permute(0, 2, 3, 4, 1).data.cpu().numpy()[0, :, :, :, :]
+                    # F_BA = F_BA.astype(np.float32) * range_flow
+                    
+                    # F_AB = F_X_Y.permute(0, 2, 3, 4, 1).data.cpu().numpy()[0, :, :, :, :]
+                    # F_AB = F_AB.astype(np.float32) * range_flow
+                    
 
-                X_Y_label = transform_nearest(X_label, F_X_Y.permute(0, 2, 3, 4, 1) * range_flow, grid).data.cpu().numpy()[0, 0, :, :, :]
-                Y_label = Y_label.data.cpu().numpy()[0, 0, :, :, :]
+                    X_Y_label = transform_nearest(X_label, F_X_Y.permute(0, 2, 3, 4, 1) * range_flow, grid).cpu().numpy()[0,0]
+                    Y_label = Y_label.cpu().numpy()[0, 0, :, :, :]
 
-                dice_score = dice(np.floor(X_Y_label), np.floor(Y_label))
-                dice_total.append(dice_score)
+                    dice_score = dice(X_Y_label, Y_label)
 
-                inverse_compose = com_transform(F_X_Y, F_Y_X, grid, range_flow)
-                violation = torch.mean((inverse_compose*range_flow)**2).item()
-                violation_total.append(violation)
-                
-                # warped_B = transform(moved_img, F_Y_X.permute(0, 2, 3, 4, 1) * range_flow, grid).data.cpu().numpy()[0, 0, :, :, :]
-                # warped_A = transform(fixed_img, F_X_Y.permute(0, 2, 3, 4, 1) * range_flow, grid).data.cpu().numpy()[0, 0, :, :, :]
+                    dice_total.append(dice_score)
 
-                # save_flow(F_BA, savepath + '/wrapped_flow_B_to_A_full_size.nii.gz')
-                # save_flow(F_AB, savepath + '/wrapped_flow_A_to_B_full_size.nii.gz')
+                    inverse_compose = com_transform(F_X_Y, F_Y_X, grid, range_flow)
+                    violation = torch.mean(torch.sum((inverse_compose*range_flow)**2, dim=1)).item()
+                    violation_total.append(violation)
 
-                # save_img(warped_B, savepath + '/wrapped_norm_B_to_A_full_size.nii.gz', header=moved_header, affine=moved_affine)
-                # save_img(warped_A, savepath + '/wrapped_norm_A_to_B_full_size.nii.gz', header=fixed_header, affine=fixed_affine)
-                
-                # print("Finished.")
+                    flips_total.append((JacboianDet(F_X_Y.permute(0,2,3,4,1), grid)<0).float().mean().item()*100.)
+                    
+                    # warped_B = transform(moved_img, F_Y_X.permute(0, 2, 3, 4, 1) * range_flow, grid).data.cpu().numpy()[0, 0, :, :, :]
+                    # warped_A = transform(fixed_img, F_X_Y.permute(0, 2, 3, 4, 1) * range_flow, grid).data.cpu().numpy()[0, 0, :, :, :]
+
+                    # save_flow(F_BA, savepath + '/wrapped_flow_B_to_A_full_size.nii.gz')
+                    # save_flow(F_AB, savepath + '/wrapped_flow_A_to_B_full_size.nii.gz')
+
+                    # save_img(warped_B, savepath + '/wrapped_norm_B_to_A_full_size.nii.gz', header=moved_header, affine=moved_affine)
+                    # save_img(warped_A, savepath + '/wrapped_norm_A_to_B_full_size.nii.gz', header=fixed_header, affine=fixed_affine)
+                    
+                    # print("Finished.")
     
     print(f"Dice mean:{np.array(dice_total).mean()}")
-    print(f"Dice mean:{np.array(violation_total).mean()}")
+    print(f"Violation to id mean:{np.array(violation_total).mean()}")
+    print(f"Flips(%) mean:{np.array(flips_total).mean()}")
 
 
 if __name__ == '__main__':
     # imgshape = (160, 192, 224)
     imgshape = (160, 144, 192)
     range_flow = 100
+
+    interpolate_first = False
 
     opt = parser.parse_args()
 
